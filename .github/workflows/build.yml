@@ -1,0 +1,183 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "Run mode"
+        type: choice
+        options: ["Full Run", "Dry Run"]
+        default: "Full Run"
+      root_type:
+        description: "Root solution"
+        type: choice
+        options: ["VANILLA", "RESUKISU", "KSUN"]
+        default: "VANILLA"
+      lto_mode:
+        description: "LTO mode"
+        type: choice
+        options: ["THIN", "FULL", "NONE"]
+        default: "THIN"
+      use_ext_modules:
+        description: "Build vendor MTK modules (EXT_MODULES)"
+        type: boolean
+        default: true
+      addons:
+        description: "Comma-separated addons to build (e.g. overclock_mt6789) — blank = none"
+        type: string
+        default: ""
+      modules_filter:
+        description: "Substring filter for the all-modules zip (blank = every .ko)"
+        type: string
+        default: ""
+      kernel_branch:
+        description: "Override kernel branch (blank = repo default)"
+        type: string
+        default: ""
+      kernel_name:
+        description: "LOCALVERSION suffix"
+        type: string
+        default: "RockKernel"
+      zip_prefix:
+        description: "Output zip filename prefix"
+        type: string
+        default: "Rock-Kernel"
+      upload_release:
+        description: "Publish the flashable kernel zip to GitHub Releases"
+        type: boolean
+        default: true
+      cache_workspace:
+        description: "Cache the built workspace to speed up a later rerun with the same config"
+        type: boolean
+        default: true
+
+concurrency:
+  group: Rock_Project-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # GKI builds are heavy (compile time + disk). If the default
+    # GitHub-hosted runner runs out of space/time, point this at a
+    # self-hosted runner or a larger GitHub-hosted size instead.
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write   # needed by softprops/action-gh-release below
+
+    env:
+      RUN_MODE: ${{ inputs.run_mode }}
+      ROOT_TYPE: ${{ inputs.root_type }}
+      LTO_MODE: ${{ inputs.lto_mode }}
+      USE_EXT_MODULES: ${{ inputs.use_ext_modules && 'y' || 'n' }}
+      ADDONS: ${{ inputs.addons }}
+      MODULES_FILTER: ${{ inputs.modules_filter }}
+      KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+      KERNEL_NAME: ${{ inputs.kernel_name }}
+      ZIP_PREFIX: ${{ inputs.zip_prefix }}
+
+    steps:
+      - name: Checkout Rock_Project
+        uses: actions/checkout@v4
+
+      # GKI trees + repo sync easily eat >30GB; free up runner disk first.
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo docker image prune -af || true
+          df -h
+
+      # Cache key is the real build fingerprint from lib/functions.sh
+      # build_fingerprint() (repo/branch/manifest/root/lto) — sourced
+      # directly so this never silently drifts from the script's own
+      # mismatch check. KERNEL_REPO/GKI_MANIFEST_BRANCH aren't
+      # workflow inputs, so they come from config/defaults.env as-is.
+      - name: Compute cache key
+        id: cache_key
+        run: |
+          export KERNEL_BRANCH="${{ inputs.kernel_branch }}"
+          export ROOT_TYPE="${{ inputs.root_type }}"
+          export LTO_MODE="${{ inputs.lto_mode }}"
+          source config/defaults.env
+          source lib/functions.sh
+          FP="$(build_fingerprint)"
+          echo "key=rock-workspace-$(echo -n "$FP" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore/cache workspace
+        if: inputs.cache_workspace
+        uses: actions/cache@v4
+        with:
+          path: |
+            workspace/common
+            workspace/out
+            workspace/prebuilts
+            workspace/build.config.common
+            workspace/build.config.aarch64
+            workspace/.fingerprint
+          key: ${{ steps.cache_key.outputs.key }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ steps.cache_key.outputs.key }}-
+
+      - name: Run build
+        run: bash build.sh
+
+      # release-out/ contains, every run:
+      #   - "<zip_prefix><root_suffix>.zip"          — flashable kernel (image only, always gzip-compressed)
+      #   - "<zip_prefix><root_suffix>-addons.zip"   — enabled addons' .ko only, absent if $ADDONS was blank
+      #   - "<zip_prefix><root_suffix>-modules.zip"  — every .ko built this run: vendor MTK + in-tree GKI + addons
+      - name: Upload flashable kernel
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rock-kernel-${{ github.run_number }}
+          path: |
+            release-out/${{ inputs.zip_prefix }}*.zip
+            !release-out/${{ inputs.zip_prefix }}*-addons.zip
+            !release-out/${{ inputs.zip_prefix }}*-modules.zip
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload addon modules
+        if: always() && inputs.addons != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: rock-kernel-addons-${{ github.run_number }}
+          path: release-out/${{ inputs.zip_prefix }}*-addons.zip
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload all modules
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rock-kernel-modules-${{ github.run_number }}
+          path: release-out/${{ inputs.zip_prefix }}*-modules.zip
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: workspace/build.log
+          if-no-files-found: ignore
+
+      - name: Locate flashable zip
+        id: flashable
+        if: success() && inputs.run_mode == 'Full Run' && inputs.upload_release == true
+        run: |
+          source lib/functions.sh
+          FLASHABLE_ZIP="release-out/${ZIP_PREFIX}$(get_root_suffix).zip"
+          [ -f "$FLASHABLE_ZIP" ] || { echo "::error::Flashable zip not found: $FLASHABLE_ZIP"; exit 1; }
+          echo "path=${FLASHABLE_ZIP}" >> "$GITHUB_OUTPUT"
+
+      # Gated behind the upload_release toggle — leave it off for
+      # throwaway/debug builds you don't want cluttering the Releases page.
+      - name: Create GitHub Release
+        if: success() && inputs.run_mode == 'Full Run' && inputs.upload_release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.kernel_name }}-${{ inputs.root_type }}-${{ github.run_number }}
+          name: ${{ inputs.kernel_name }}-${{ inputs.root_type }} #${{ github.run_number }}
+          files: ${{ steps.flashable.outputs.path }}
