@@ -16,8 +16,29 @@ else
     ok ".repo already present, skipping repo init."
 fi
 
+# When workspace/common is restored from the GH Actions cache but
+# workspace/.repo is not (see .github/workflows/build.yml — .repo isn't
+# cached), common/ on disk is actually last run's plain `git clone` of
+# $KERNEL_REPO (we replace the AOSP tree with it further down), not a
+# repo-managed checkout. repo sync then tries to check out the AOSP
+# "kernel/common" project on top of that unrelated git history and dies
+# with "unsupported checkout state". Since we overwrite common/ with a
+# fresh AOSP checkout in the next step anyway, just move it aside first
+# so repo sync always sees a clean path — we reuse it below as a local
+# reference to speed the kernel git clone back up instead of losing it.
+CACHED_COMMON=""
+if [ -d "common" ] && [ ! -d ".repo/projects/common.git" ]; then
+    warn "common/ present without matching .repo state (stale cache) — moving aside for repo sync."
+    rm -rf common.cache
+    mv common common.cache
+    CACHED_COMMON="$WORKSPACE/common.cache"
+fi
+
 log "repo sync..."
-repo sync -j"$(nproc)" --no-tags --no-clone-bundle --current-branch -f
+if ! repo sync -j"$(nproc)" --no-tags --no-clone-bundle --current-branch -f; then
+    warn "repo sync failed — retrying once with --force-sync (clears any other stale project checkouts)."
+    repo sync -j"$(nproc)" --no-tags --no-clone-bundle --current-branch -f --force-sync
+fi
 
 if [ -d "common" ]; then
     for f in build.config.common build.config.aarch64; do
@@ -37,10 +58,19 @@ CLONE_CMD=(git clone --depth=1)
 if [ -n "${KERNEL_BRANCH:-}" ]; then
     CLONE_CMD+=(-b "$KERNEL_BRANCH")
 fi
+# Reuse the cache-restored clone (moved aside above) as a --reference so
+# git can reuse local objects instead of re-downloading everything —
+# falls back to a plain clone automatically if the reference is missing
+# or unrelated (git ignores a --reference that shares no history).
+if [ -n "$CACHED_COMMON" ] && [ -d "$CACHED_COMMON/.git" ]; then
+    log "Reusing cached kernel clone as --reference to speed up download..."
+    CLONE_CMD+=(--reference-if-able "$CACHED_COMMON")
+fi
 CLONE_CMD+=("$KERNEL_REPO" common)
 
 log "Cloning kernel source: ${KERNEL_REPO} ${KERNEL_BRANCH:+(branch: $KERNEL_BRANCH)} -> common/"
 "${CLONE_CMD[@]}"
+rm -rf "$CACHED_COMMON"
 ok "Kernel source ready at $KERNEL_DIR"
 
 for f in build.config.common build.config.aarch64; do
