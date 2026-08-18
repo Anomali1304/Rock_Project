@@ -9,6 +9,7 @@ Out-of-tree kernel module (**v7.1**) for MediaTek MT6789 (Helio G99) providing:
 - **CPU idx0 quiesce-before-patch** — forces the cluster off idx0 (via a temporary `freq_qos` cap) and confirms via hardware (`REG_FREQ_PERF_STATE`) before rewriting a *live* LUT row; an earlier revision without this froze the device and triggered a watchdog reboot
 - **Cooling-device countermeasure** — a 50ms guardian kthread + an Energy Model top-perf-state patch, both aimed at the same symptom: `cpufreq_cooling`/EM snapping `policy->max` back to stock during thermal transitions
 - **CPU LUT diagnostic** — read-only cross-check of `policy->freq_table` (RAM) vs `REG_FREQ_LUT_TABLE` (MMIO) per cluster domain, no writes, no kprobes
+- **CPU stats refresh** — debug-only, manually triggered: rebuilds a cluster's `time_in_state` bucket table via `kallsyms`-resolved `cpufreq_stats_free_table`/`create_table`, since `mtk-cpufreq-hw`'s policy is never torn down by CPU hotplug and the stats table otherwise stays frozen at its pre-OC snapshot until reboot
 - **Suspend guard** — a PM notifier refuses OC apply operations while the device is suspending/hibernating, since MMIO/kprobe calls mid-suspend can hang the bus and trip the watchdog
 
 **Ships DISABLED at runtime** — every OC parameter defaults to `0`/off. Enabling OC on-device is a separate, manual step. Flash/insmod at your own risk.
@@ -117,6 +118,8 @@ echo 1 > /sys/module/overclock_mt6789/parameters/gpu_oc_apply
 | `cpu_oc_result` | R | Result string of last apply |
 | `cpu_ll_rep_cpu` / `cpu_b_rep_cpu` | R | Representative CPU# per cluster domain (fixed: 0 / 6) |
 | `cpu_lut_dump` | R | Read-only cross-check: `policy->freq_table` (RAM) vs `REG_FREQ_LUT_TABLE` (MMIO), per domain |
+| `cpu_stats_refresh` | W (debug) | Write `1`=little / `2`=big to rebuild that cluster's `time_in_state` table so it reflects the patched idx0 freq without a reboot. Not called automatically from `cpu_oc_apply` — trigger manually, one cluster at a time |
+| `cpu_stats_refresh` (read) | R | Result string of last refresh (`OK: ...` / `FAIL: ...`) |
 
 ```bash
 # Set little cluster to 2100MHz, big cluster to 2500MHz, apply
@@ -132,6 +135,18 @@ cat /sys/module/overclock_mt6789/parameters/cpu_lut_dump
 echo 0 > /sys/module/overclock_mt6789/parameters/cpu_ll_target_khz
 echo 0 > /sys/module/overclock_mt6789/parameters/cpu_b_target_khz
 echo 1 > /sys/module/overclock_mt6789/parameters/cpu_oc_apply
+```
+
+```bash
+# Refresh time_in_state so it shows the OC'd frequency (no reboot needed)
+# Try big cluster first — lower blast radius than little (cpu0 is the boot CPU)
+echo 2 > /sys/module/overclock_mt6789/parameters/cpu_stats_refresh
+cat /sys/module/overclock_mt6789/parameters/cpu_stats_refresh
+dmesg | tail -20
+cat /sys/devices/system/cpu/cpu6/cpufreq/stats/time_in_state
+
+# Only after big cluster is confirmed clean, try little
+echo 1 > /sys/module/overclock_mt6789/parameters/cpu_stats_refresh
 ```
 
 ## Verified Results
@@ -152,6 +167,7 @@ _Not yet filled in — add your tested stable targets here once confirmed on-dev
 - **`signed_table` patching is optional.** If `gpufreq_get_signed_table` doesn't resolve, only `working_table` gets patched; this doesn't block the normal success path.
 - **`cpufreq_mtk_mirror` struct layout is reverse-engineered**, confirmed via `cpu_lut_dump` cross-checks against live hardware — not from an upstream/generic definition. A vendor driver update could shift field offsets silently.
 - **CFI**: built with `CONFIG_CFI_CLANG=y`; every indirect call through a kprobe/kallsyms-resolved pointer is `__nocfi`.
+- **`cpu_stats_refresh` is debug-only, not part of the OC apply path.** `cpufreq_stats_free_table`/`create_table` are confirmed matching this signature against this kernel's own `drivers/cpufreq/cpufreq_stats.c` (android12-5.10 branch), but like the other kallsyms-resolved symbols, a vendor tree update could shift behavior. Only `policy->rwsem` is held during the rebuild (matching what the cpufreq core itself holds on the offline/online path) — the module does not otherwise coordinate with the governor. `create_table()` seeds `last_index` from `policy->cur`, which the CPU OC path never updates through the normal transition notifier chain (it patches MMIO/RAM directly); the refresh writes `policy->cur` to the current target just before rebuilding to avoid a stale `last_index`, but if `cpu_*_target_khz` is `0` (OC not applied) this sync is skipped and `policy->cur` is left as whatever the core last set. Trigger one cluster at a time, big before little (little's rep CPU is `cpu0`, the boot CPU).
 
 ## Requirements
 
