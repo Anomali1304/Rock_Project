@@ -909,7 +909,7 @@ MODULE_PARM_DESC(cpu_lut_dump, "READ-ONLY: dump policy->freq_table vs REG_FREQ_L
  * value here avoids that gap. */
 static char cpu_stats_refresh_result[128] = "not triggered yet";
 
-static int do_stats_refresh(unsigned int rep_cpu, unsigned int cur_khz)
+static __nocfi int do_stats_refresh(unsigned int rep_cpu, unsigned int cur_khz)
 {
 	struct cpufreq_policy *policy;
 
