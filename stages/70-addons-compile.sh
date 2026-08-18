@@ -27,6 +27,12 @@ for addon in "${ADDON_LIST[@]}"; do
     : "${CROSS_COMPILE:=aarch64-linux-gnu-}"
     : "${CLANG_TRIPLE:=aarch64-linux-gnu-}"
 
+    # KCFLAGS is read by Kbuild independently of each addon's own
+    # EXTRA_CFLAGS/ccflags-y, so it's the one place to centrally silence
+    # deprecated-flag-as-error issues (e.g. newer clang turning the GKI
+    # tree's trivial-auto-var-init flag into a hard error) across every
+    # addon, regardless of CLANG_VENDOR. No-op on clang versions that
+    # never emit that warning.
     # LLVM_IAS=1 required alongside LLVM=1 for -fsanitize=kcfi codegen, or insmod panics on KCFI validation
     PATH="$CLANG_BIN_DIR:$PATH" \
     make -C "$STAGE_DIR" \
@@ -36,7 +42,8 @@ for addon in "${ADDON_LIST[@]}"; do
         CC="$CLANG_BIN_DIR/clang" \
         CLANG_TRIPLE="$CLANG_TRIPLE" \
         LLVM=1 \
-        LLVM_IAS=1
+        LLVM_IAS=1 \
+        KCFLAGS="${KCFLAGS:--Wno-unused-command-line-argument}"
 
     KO="$STAGE_DIR/${addon}.ko"
     [ -f "$KO" ] || error "${addon}: build finished but ${addon}.ko not found (obj-m target must match the addon's dir/file name)."
