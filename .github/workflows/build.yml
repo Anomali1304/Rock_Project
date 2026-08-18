@@ -3,11 +3,25 @@ name: Build
 on:
   workflow_dispatch:
     inputs:
+      # --- Run behavior ---
       run_mode:
         description: "Run mode"
         type: choice
         options: ["Full Run", "Dry Run"]
         default: "Full Run"
+
+      # --- Toolchain ---
+      clang_vendor:
+        description: "Clang toolchain"
+        type: choice
+        options: ["GKI", "ZyC", "Custom"]
+        default: "GKI"
+      clang_custom_url:
+        description: "Clang Vendor=Custom only — tar.gz/tar.zst/tar.xz URL to download"
+        type: string
+        default: ""
+
+      # --- Kernel options ---
       root_type:
         description: "Root solution"
         type: choice
@@ -18,10 +32,12 @@ on:
         type: choice
         options: ["THIN", "FULL", "NONE"]
         default: "THIN"
-      use_ext_modules:
+      enable_ext_modules:
         description: "Build vendor MTK modules (EXT_MODULES)"
         type: boolean
         default: true
+
+      # --- Addons ---
       addons:
         description: "Comma-separated addons to build (e.g. overclock_mt6789) — blank = none"
         type: string
@@ -30,6 +46,8 @@ on:
         description: "Substring filter for the all-modules zip (blank = every .ko)"
         type: string
         default: ""
+
+      # --- Identity ---
       kernel_branch:
         description: "Override kernel branch (blank = repo default)"
         type: string
@@ -42,7 +60,9 @@ on:
         description: "Output zip filename prefix"
         type: string
         default: "Rock-Kernel"
-      upload_release:
+
+      # --- Output ---
+      publish_release:
         description: "Publish the flashable kernel zip to GitHub Releases"
         type: boolean
         default: true
@@ -67,9 +87,11 @@ jobs:
 
     env:
       RUN_MODE: ${{ inputs.run_mode }}
+      CLANG_VENDOR: ${{ inputs.clang_vendor }}
+      CLANG_CUSTOM_URL: ${{ inputs.clang_custom_url }}
       ROOT_TYPE: ${{ inputs.root_type }}
       LTO_MODE: ${{ inputs.lto_mode }}
-      USE_EXT_MODULES: ${{ inputs.use_ext_modules && 'y' || 'n' }}
+      USE_EXT_MODULES: ${{ inputs.enable_ext_modules && 'y' || 'n' }}
       ADDONS: ${{ inputs.addons }}
       MODULES_FILTER: ${{ inputs.modules_filter }}
       KERNEL_BRANCH: ${{ inputs.kernel_branch }}
@@ -165,17 +187,17 @@ jobs:
 
       - name: Locate flashable zip
         id: flashable
-        if: success() && inputs.run_mode == 'Full Run' && inputs.upload_release == true
+        if: success() && inputs.run_mode == 'Full Run' && inputs.publish_release == true
         run: |
           source lib/functions.sh
           FLASHABLE_ZIP="release-out/${ZIP_PREFIX}$(get_root_suffix).zip"
           [ -f "$FLASHABLE_ZIP" ] || { echo "::error::Flashable zip not found: $FLASHABLE_ZIP"; exit 1; }
           echo "path=${FLASHABLE_ZIP}" >> "$GITHUB_OUTPUT"
 
-      # Gated behind the upload_release toggle — leave it off for
+      # Gated behind the publish_release toggle — leave it off for
       # throwaway/debug builds you don't want cluttering the Releases page.
       - name: Create GitHub Release
-        if: success() && inputs.run_mode == 'Full Run' && inputs.upload_release == true
+        if: success() && inputs.run_mode == 'Full Run' && inputs.publish_release == true
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.kernel_name }}-${{ inputs.root_type }}-${{ github.run_number }}
