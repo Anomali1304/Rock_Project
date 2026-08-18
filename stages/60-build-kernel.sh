@@ -23,12 +23,34 @@ export KBUILD_BUILD_USER="$BUILD_USER_NAME"
 export KBUILD_BUILD_HOST="$BUILD_HOST_NAME"
 
 if [ "${CLANG_VENDOR:-GKI}" != "GKI" ] && [ -x "${CLANG_CUSTOM_PATH}/bin/clang" ]; then
+    # Just prepending PATH isn't enough: build/build.sh re-derives its own
+    # PATH from CLANG_PREBUILT_BIN (set in build.config.common) and puts
+    # that ahead of whatever PATH we export here, so the GKI prebuilt clang
+    # silently wins over ${CLANG_VENDOR} unless we repoint that var too.
+    rel_clang_bin="$(realpath --relative-to="$WORKSPACE" "${CLANG_CUSTOM_PATH}/bin")"
+    common_cfg="$KERNEL_DIR/build.config.common"
+    if [ -f "$common_cfg" ] && grep -q '^CLANG_PREBUILT_BIN=' "$common_cfg"; then
+        sed -i "s|^CLANG_PREBUILT_BIN=.*|CLANG_PREBUILT_BIN=${rel_clang_bin}|" "$common_cfg"
+        log "build.config.common: CLANG_PREBUILT_BIN -> ${rel_clang_bin}"
+    else
+        error "common/build.config.common missing CLANG_PREBUILT_BIN — cannot force ${CLANG_VENDOR} clang onto the GKI build."
+    fi
+
     export PATH="${CLANG_CUSTOM_PATH}/bin:${PATH}"
     export LD_LIBRARY_PATH="${CLANG_CUSTOM_PATH}/lib:${LD_LIBRARY_PATH:-}"
     log "Using ${CLANG_VENDOR} clang from ${CLANG_CUSTOM_PATH}"
 fi
 export KBUILD_COMPILER_STRING="$(clang_vendor_label) $(get_clang_version)"
 log "KBUILD_COMPILER_STRING -> ${KBUILD_COMPILER_STRING}"
+
+# Vendor-agnostic compat flag: newer clang (16+, e.g. ZyC/Custom builds)
+# deprecates flags the GKI tree still passes (e.g. the trivial-auto-var-init
+# flag), and turns that deprecation into a hard error via -Werror,-Wunused-
+# command-line-argument. This flag is a no-op on older clang (GKI's own
+# r416183b, 12.0.5) since it never emits that warning there, so it's safe
+# to export unconditionally regardless of which CLANG_VENDOR was picked.
+export KCFLAGS="${KCFLAGS:+$KCFLAGS }-Wno-unused-command-line-argument"
+log "KCFLAGS -> ${KCFLAGS}"
 
 if [ "${DRY_RUN:-false}" = "true" ]; then
     warn "DRY_RUN=true — skipping actual compile."
