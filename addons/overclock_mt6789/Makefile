@@ -34,7 +34,8 @@ EXTRA_CFLAGS  := \
   -Wno-unused-variable \
   -Wno-unused-function \
   -Wno-int-to-pointer-cast \
-  -Wno-pointer-to-int-cast
+  -Wno-pointer-to-int-cast \
+  -Wno-unused-command-line-argument
 
 all:
 	@echo "  [overclock_mt6789] Using Clang: $(CLANG_PATH)/clang"
