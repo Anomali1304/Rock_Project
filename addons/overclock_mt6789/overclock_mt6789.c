@@ -156,8 +156,8 @@ module_param(gpu_target_vsram, uint, 0644);
 MODULE_PARM_DESC(gpu_target_vsram, "GPU vsram mV*100 (0=same as volt)");
 module_param_string(gpu_oc_result, gpu_oc_result, sizeof(gpu_oc_result), 0444);
 MODULE_PARM_DESC(gpu_oc_result, "GPU OC status (read-only)");
-module_param_string(gpu_opp_dump,  gpu_opp_dump,  sizeof(gpu_opp_dump),  0444);
-MODULE_PARM_DESC(gpu_opp_dump, "GPU OPP table dump (read-only)");
+/* gpu_opp_dump itself is registered as a live module_param_cb further down,
+ * right after update_gpu_opp_dump() is defined — see gpu_opp_dump_get(). */
 
 static DEFINE_MUTEX(oc_lock);
 
@@ -373,6 +373,21 @@ static __nocfi void update_gpu_opp_dump(void)
 			i, (i < GPU_OPP_MAX && g_gpu_patched[i]) ? "*" : " ",
 			wt[i].freq, wt[i].volt, wt[i].vsram);
 }
+
+/* Live read: recompute on every sysfs read instead of relying on a stale
+ * snapshot from the last apply. Mirrors cpu_lut_dump's module_param_cb
+ * pattern below, so the GPU dump shows current state immediately after
+ * insmod, before any OC has ever been applied. */
+static int gpu_opp_dump_get(char *buf, const struct kernel_param *kp)
+{
+	mutex_lock(&oc_lock);
+	update_gpu_opp_dump();
+	mutex_unlock(&oc_lock);
+	return scnprintf(buf, PAGE_SIZE, "%s", gpu_opp_dump);
+}
+static const struct kernel_param_ops gpu_opp_dump_ops = { .get = gpu_opp_dump_get };
+module_param_cb(gpu_opp_dump, &gpu_opp_dump_ops, NULL, 0444);
+MODULE_PARM_DESC(gpu_opp_dump, "READ-ONLY: live GPU OPP table dump (freq/volt/vsram), recomputed on every read");
 
 /* kretprobe on gpufreq_commit(): kicks the PLL resync workqueue when
  * the driver commits into a patched index. */
