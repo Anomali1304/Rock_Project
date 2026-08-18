@@ -118,6 +118,13 @@ static fn_kallsyms_lookup_name_t sym_kallsyms_lookup_name;
 typedef bool (*fn_mtk_fh_set_rate_t)(const char *name, unsigned long dds, int postdiv);
 static fn_mtk_fh_set_rate_t sym_mtk_fh_set_rate;
 
+/* drivers/cpufreq/cpufreq_stats.c — neither EXPORT_SYMBOL'd, resolved
+ * via kallsyms below. Used only by the debug cpu_stats_refresh param. */
+typedef void (*fn_stats_free_t)(struct cpufreq_policy *policy);
+typedef void (*fn_stats_create_t)(struct cpufreq_policy *policy);
+static fn_stats_free_t   sym_cpufreq_stats_free_table;
+static fn_stats_create_t sym_cpufreq_stats_create_table;
+
 #define MFG_PLL_NAME "mfgpll"
 
 #define APMIXED_PHYS     0x1000C000UL
@@ -872,6 +879,103 @@ static const struct kernel_param_ops cpu_lut_dump_ops = { .get = cpu_lut_dump_ge
 module_param_cb(cpu_lut_dump, &cpu_lut_dump_ops, NULL, 0444);
 MODULE_PARM_DESC(cpu_lut_dump, "READ-ONLY: dump policy->freq_table vs REG_FREQ_LUT_TABLE per domain");
 
+/* ===== CPU STATS REFRESH — debug/manual only, NOT called from cpu_oc_apply =====
+ * cpufreq_stats (drivers/cpufreq/cpufreq_stats.c) builds its
+ * time_in_state bucket table ONCE, in cpufreq_stats_create_table(),
+ * from a snapshot of freq_table taken at policy-online time. It never
+ * re-scans freq_table afterward, and mtk-cpufreq-hw's policy is never
+ * torn down by CPU hotplug (it's bound to a persistent platform
+ * device, not per-CPU), so patching idx0 post-boot leaves the old
+ * bucket label in place with no way to refresh it short of a reboot.
+ *
+ * This forces a rebuild by calling the same free+create pair the
+ * cpufreq core calls internally on offline/online, done manually
+ * here under policy->rwsem. Confirmed against this kernel's actual
+ * drivers/cpufreq/cpufreq_stats.c (android12-5.10 branch):
+ *   void cpufreq_stats_free_table(struct cpufreq_policy *policy)
+ *   void cpufreq_stats_create_table(struct cpufreq_policy *policy)
+ * Neither is EXPORT_SYMBOL'd, hence kallsyms resolution below.
+ *
+ * cpufreq_stats_create_table() seeds last_index from policy->cur:
+ *   stats->last_index = freq_table_get_index(stats, policy->cur);
+ * Our idx0 patch writes MMIO + policy->freq_table[0] directly,
+ * bypassing the normal cpufreq_freq_transition_begin/end notifier
+ * chain — so policy->cur can still hold the pre-patch value at
+ * refresh time. If it doesn't match any entry in the freshly-built
+ * table, last_index resolves invalid and live time only starts
+ * accumulating again after the next real governor transition (no
+ * crash either way — show_time_in_state() just skips the live-time
+ * add when nothing matches). Syncing policy->cur to the patched
+ * value here avoids that gap. */
+static char cpu_stats_refresh_result[128] = "not triggered yet";
+
+static int do_stats_refresh(unsigned int rep_cpu, unsigned int cur_khz)
+{
+	struct cpufreq_policy *policy;
+
+	if (!sym_cpufreq_stats_free_table || !sym_cpufreq_stats_create_table)
+		return -ENOSYS;
+
+	policy = cpufreq_cpu_get(rep_cpu);
+	if (!policy)
+		return -ENODEV;
+
+	down_write(&policy->rwsem);
+	if (cur_khz)
+		policy->cur = cur_khz;   /* sync before create_table reads policy->cur */
+	sym_cpufreq_stats_free_table(policy);
+	sym_cpufreq_stats_create_table(policy);
+	up_write(&policy->rwsem);
+
+	cpufreq_cpu_put(policy);
+	return 0;
+}
+
+static int cpu_stats_refresh_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int which;
+	int ret;
+
+	if (kstrtouint(val, 10, &which))
+		return -EINVAL;
+
+	/* 1 = little cluster, 2 = big cluster. One at a time, on purpose. */
+	if (which != 1 && which != 2)
+		return -EINVAL;
+
+	if (atomic_read(&oc_mt6789_suspended)) {
+		snprintf(cpu_stats_refresh_result, sizeof(cpu_stats_refresh_result),
+			 "FAIL: device suspending, refused");
+		return 0;
+	}
+
+	mutex_lock(&oc_lock);
+	ret = do_stats_refresh(which == 1 ? cpu_ll_rep_cpu : cpu_b_rep_cpu,
+				which == 1 ? cpu_ll_target_khz : cpu_b_target_khz);
+	if (ret == -ENOSYS)
+		snprintf(cpu_stats_refresh_result, sizeof(cpu_stats_refresh_result),
+			 "FAIL: stats symbols not resolved");
+	else if (ret == -ENODEV)
+		snprintf(cpu_stats_refresh_result, sizeof(cpu_stats_refresh_result),
+			 "FAIL: cpu%u not found/online", which == 1 ? cpu_ll_rep_cpu : cpu_b_rep_cpu);
+	else
+		snprintf(cpu_stats_refresh_result, sizeof(cpu_stats_refresh_result),
+			 "OK: refreshed cluster %u — check time_in_state now", which);
+	mutex_unlock(&oc_lock);
+	return 0;
+}
+static int cpu_stats_refresh_get(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "%s\n", cpu_stats_refresh_result);
+}
+static const struct kernel_param_ops cpu_stats_refresh_ops = {
+	.set = cpu_stats_refresh_set,
+	.get = cpu_stats_refresh_get,
+};
+static int cpu_stats_refresh_dummy = 0;
+module_param_cb(cpu_stats_refresh, &cpu_stats_refresh_ops, &cpu_stats_refresh_dummy, 0644);
+MODULE_PARM_DESC(cpu_stats_refresh, "DEBUG: write 1=little / 2=big to rebuild that cluster's time_in_state table");
+
 /* ========== Module init/exit ========== */
 static int __init oc_mt6789_init(void)
 {
@@ -931,6 +1035,18 @@ static int __init oc_mt6789_init(void)
 		} else {
 			pr_warn("oc_mt6789: g_working_table not found via kallsyms (CONFIG_KALLSYMS_ALL off, ged.ko not loaded yet, or gpufreq v1 build) — GPU OC still applies at hardware level, but /sys/kernel/ged/hal/current_freqency will keep showing stock freq\n");
 		}
+
+		addr = sym_kallsyms_lookup_name("cpufreq_stats_free_table");
+		if (addr)
+			sym_cpufreq_stats_free_table = (fn_stats_free_t)addr;
+		else
+			pr_warn("oc_mt6789: cpufreq_stats_free_table not found — cpu_stats_refresh unavailable\n");
+
+		addr = sym_kallsyms_lookup_name("cpufreq_stats_create_table");
+		if (addr)
+			sym_cpufreq_stats_create_table = (fn_stats_create_t)addr;
+		else
+			pr_warn("oc_mt6789: cpufreq_stats_create_table not found — cpu_stats_refresh unavailable\n");
 	} else {
 		pr_warn("oc_mt6789: kallsyms_lookup_name not found — GPU PCW change fails safe, and GED sync is unavailable\n");
 	}
