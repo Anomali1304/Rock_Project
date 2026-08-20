@@ -125,9 +125,10 @@ jobs:
           FP="$(build_fingerprint)"
           echo "key=rock-workspace-v2-$(echo -n "$FP" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
-      - name: Restore/cache workspace
+      - name: Restore workspace
         if: inputs.cache_workspace
-        uses: actions/cache@v4
+        id: restore_cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             workspace/.repo
@@ -143,6 +144,25 @@ jobs:
 
       - name: Run build
         run: bash build.sh
+
+      # Saved explicitly and only on success, so a run that fails or
+      # gets killed mid-sync (e.g. by the concurrency cancel-in-progress
+      # group) never overwrites the cache with a half-checked-out
+      # workspace/common/.git — that's what produced the "unsupported
+      # checkout state" repo-sync failure this replaced.
+      - name: Save workspace
+        if: always() && inputs.cache_workspace && success()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            workspace/.repo
+            workspace/common
+            workspace/out
+            workspace/prebuilts
+            workspace/build.config.common
+            workspace/build.config.aarch64
+            workspace/.fingerprint
+          key: ${{ steps.cache_key.outputs.key }}-${{ github.run_id }}
 
       # release-out/ contains, every run:
       #   - "<zip_prefix><root_suffix>.zip"          — flashable kernel (image only, always gzip-compressed)
