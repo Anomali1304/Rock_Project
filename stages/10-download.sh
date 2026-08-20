@@ -16,24 +16,13 @@ else
     ok ".repo already present, skipping repo init."
 fi
 
-# workspace/.repo AND workspace/common are both restored from the GH
-# Actions cache together (see .github/workflows/build.yml). Normally
-# that's consistent, but a run that got killed mid-sync (e.g. the
-# concurrency cancel-in-progress group cancelling an in-flight run)
-# can still have its cache saved by actions/cache's post step with
-# common/.git left in a half-checked-out state. repo then dies with
-# "unsupported checkout state" and a plain retry can't fix it, because
-# it's not a stale/mismatched ref — the worktree itself is broken.
-#
-# So validate common/'s git state for real (not just "does the .repo
-# project dir exist") before trusting the cache. Since we overwrite
-# common/ with a fresh AOSP checkout in the next step anyway, just
-# move it aside first so repo sync always sees a clean path — we
-# reuse it below as a local reference to speed the kernel git clone
-# back up instead of losing it.
+# Never let a cache-restored kernel/common worktree participate in repo sync.
+# The repo metadata/object store remains cacheable, but the checked-out
+# worktree is disposable. This permanently prevents a stale/cancelled
+# common/.git checkout from poisoning the next run.
 CACHED_COMMON=""
-if [ -d "common" ] && { [ ! -d ".repo/projects/common.git" ] || ! git -C common rev-parse --is-inside-work-tree >/dev/null 2>&1; }; then
-    warn "common/ present without a usable checkout (stale/corrupt cache) — moving aside for repo sync."
+if [ -d "common" ]; then
+    log "Quarantining cache-restored common/ before repo sync..."
     rm -rf common.cache
     mv common common.cache
     CACHED_COMMON="$WORKSPACE/common.cache"
@@ -41,16 +30,16 @@ fi
 
 log "repo sync..."
 if ! repo sync -j"$(nproc)" --no-tags --no-clone-bundle --current-branch -f; then
-    warn "repo sync failed — retrying once with --force-sync (clears any other stale project checkouts)."
+    warn "repo sync failed — retrying with --force-sync."
     if ! repo sync -j"$(nproc)" --no-tags --no-clone-bundle --current-branch -f --force-sync; then
-        warn "repo sync still failing — .repo state itself looks corrupt, wiping it and starting a clean sync."
+        warn "repo sync still failing — cached repo metadata is unusable. Wiping .repo and rebuilding it cleanly."
         rm -rf .repo
         repo init --no-repo-verify \
             -u https://android.googlesource.com/kernel/manifest \
             -b "${GKI_MANIFEST_BRANCH}" \
             --repo-rev=main \
             --depth=1
-        repo sync -j"$(nproc)" --no-tags --no-clone-bundle --current-branch -f
+        repo sync -j"$(nproc)" --no-tags --no-clone-bundle --current-branch -f --force-sync
     fi
 fi
 
@@ -72,14 +61,11 @@ CLONE_CMD=(git clone --depth=1)
 if [ -n "${KERNEL_BRANCH:-}" ]; then
     CLONE_CMD+=(-b "$KERNEL_BRANCH")
 fi
-# Reuse the cache-restored clone (moved aside above) as a --reference so
-# git can reuse local objects instead of re-downloading everything —
-# falls back to a plain clone automatically if the reference is missing
-# or unrelated (git ignores a --reference that shares no history).
-if [ -n "$CACHED_COMMON" ] && [ -d "$CACHED_COMMON/.git" ]; then
-    log "Reusing cached kernel clone as --reference to speed up download..."
-    CLONE_CMD+=(--reference-if-able "$CACHED_COMMON")
-fi
+# Do not use the quarantined AOSP common/ as a Git alternates/reference
+# source. The AOSP manifest checkout and the Xiaomi kernel repository are
+# different repositories, and deleting a reference repository after clone
+# can leave .git/objects/info/alternates pointing at a missing path.
+
 CLONE_CMD+=("$KERNEL_REPO" common)
 
 log "Cloning kernel source: ${KERNEL_REPO} ${KERNEL_BRANCH:+(branch: $KERNEL_BRANCH)} -> common/"
@@ -111,7 +97,5 @@ else
     fi
 fi
 
-# Records the config this workspace was built with, so a rerun that
-# restores it from cache (see .github/workflows/build.yml) can detect
-# a mismatched fingerprint.
+# Record the effective source/build configuration for diagnostics.
 build_fingerprint > "$WORKSPACE/.fingerprint"
