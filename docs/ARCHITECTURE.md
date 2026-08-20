@@ -30,10 +30,12 @@ stale output from an earlier run, so what you get is always fresh.
 In CI this is one workflow, `.github/workflows/build.yml`, which
 uploads up to three artifacts per run (`rock-kernel-*`,
 `rock-kernel-addons-*` if addons were set, `rock-kernel-modules-*`).
-`cache_workspace` (an `actions/cache` entry keyed on a build
-fingerprint — kernel repo, branch, manifest branch, root type, LTO
-mode) is purely a speed optimization for reruns with the *same*
-config; it never changes what gets rebuilt or repackaged.
+`cache_workspace` (an `actions/cache` entry keyed on the build
+fingerprint and cache layout) is purely a speed optimization for reruns
+with the same config. It caches repo metadata and toolchains, but never
+the checked-out `workspace/common` worktree. The kernel source is always
+checked out fresh, so a stale or cancelled Git worktree cannot break the
+next run.
 
 ## Stage pipeline
 
