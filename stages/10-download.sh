@@ -16,19 +16,24 @@ else
     ok ".repo already present, skipping repo init."
 fi
 
-# When workspace/common is restored from the GH Actions cache but
-# workspace/.repo is not (see .github/workflows/build.yml — .repo isn't
-# cached), common/ on disk is actually last run's plain `git clone` of
-# $KERNEL_REPO (we replace the AOSP tree with it further down), not a
-# repo-managed checkout. repo sync then tries to check out the AOSP
-# "kernel/common" project on top of that unrelated git history and dies
-# with "unsupported checkout state". Since we overwrite common/ with a
-# fresh AOSP checkout in the next step anyway, just move it aside first
-# so repo sync always sees a clean path — we reuse it below as a local
-# reference to speed the kernel git clone back up instead of losing it.
+# workspace/.repo AND workspace/common are both restored from the GH
+# Actions cache together (see .github/workflows/build.yml). Normally
+# that's consistent, but a run that got killed mid-sync (e.g. the
+# concurrency cancel-in-progress group cancelling an in-flight run)
+# can still have its cache saved by actions/cache's post step with
+# common/.git left in a half-checked-out state. repo then dies with
+# "unsupported checkout state" and a plain retry can't fix it, because
+# it's not a stale/mismatched ref — the worktree itself is broken.
+#
+# So validate common/'s git state for real (not just "does the .repo
+# project dir exist") before trusting the cache. Since we overwrite
+# common/ with a fresh AOSP checkout in the next step anyway, just
+# move it aside first so repo sync always sees a clean path — we
+# reuse it below as a local reference to speed the kernel git clone
+# back up instead of losing it.
 CACHED_COMMON=""
-if [ -d "common" ] && [ ! -d ".repo/projects/common.git" ]; then
-    warn "common/ present without matching .repo state (stale cache) — moving aside for repo sync."
+if [ -d "common" ] && { [ ! -d ".repo/projects/common.git" ] || ! git -C common rev-parse --is-inside-work-tree >/dev/null 2>&1; }; then
+    warn "common/ present without a usable checkout (stale/corrupt cache) — moving aside for repo sync."
     rm -rf common.cache
     mv common common.cache
     CACHED_COMMON="$WORKSPACE/common.cache"
@@ -37,7 +42,16 @@ fi
 log "repo sync..."
 if ! repo sync -j"$(nproc)" --no-tags --no-clone-bundle --current-branch -f; then
     warn "repo sync failed — retrying once with --force-sync (clears any other stale project checkouts)."
-    repo sync -j"$(nproc)" --no-tags --no-clone-bundle --current-branch -f --force-sync
+    if ! repo sync -j"$(nproc)" --no-tags --no-clone-bundle --current-branch -f --force-sync; then
+        warn "repo sync still failing — .repo state itself looks corrupt, wiping it and starting a clean sync."
+        rm -rf .repo
+        repo init --no-repo-verify \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b "${GKI_MANIFEST_BRANCH}" \
+            --repo-rev=main \
+            --depth=1
+        repo sync -j"$(nproc)" --no-tags --no-clone-bundle --current-branch -f
+    fi
 fi
 
 if [ -d "common" ]; then
