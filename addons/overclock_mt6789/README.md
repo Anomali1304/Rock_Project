@@ -113,9 +113,9 @@ echo 1 > /sys/module/overclock_mt6789/parameters/gpu_oc_apply
 | Parameter | Access | Description |
 |-----------|--------|-------------|
 | `cpu_ll_target_khz` | RW | Little cluster idx0 target/max OC freq, KHz (`0` = restore stock) |
-| `cpu_ll_min_lock_khz` | RW | Little cluster hard minimum via FREQ_QOS_MIN (`0` = disabled; `2600000` = lock at 2600MHz after OC max is installed) |
+| `cpu_ll_min_lock_khz` | RW | Little cluster hard minimum via FREQ_QOS_MIN. When active, the module also mirrors the effective floor into `policy->min` so `scaling_min_freq` and FKM show the same value (`0` = disabled). |
 | `cpu_b_target_khz` | RW | Big cluster idx0 target/max OC freq, KHz (`0` = restore stock) |
-| `cpu_b_min_lock_khz` | RW | Big cluster hard minimum via FREQ_QOS_MIN (`0` = disabled; `2600000` = lock at 2600MHz after OC max is installed) |
+| `cpu_b_min_lock_khz` | RW | Big cluster hard minimum via FREQ_QOS_MIN. When active, the module also mirrors the effective floor into `policy->min` so `scaling_min_freq` and FKM show the same value (`0` = disabled). |
 | `cpu_oc_apply` | W | Write `1` to apply both targets |
 | `cpu_oc_result` | R | Result string of last apply |
 | `cpu_ll_rep_cpu` / `cpu_b_rep_cpu` | R | Representative CPU# per cluster domain (fixed: 0 / 6) |
@@ -137,6 +137,60 @@ cat /sys/module/overclock_mt6789/parameters/cpu_lut_dump
 echo 0 > /sys/module/overclock_mt6789/parameters/cpu_ll_target_khz
 echo 0 > /sys/module/overclock_mt6789/parameters/cpu_b_target_khz
 echo 1 > /sys/module/overclock_mt6789/parameters/cpu_oc_apply
+```
+
+
+### FKM / `scaling_min_freq` compatibility
+
+On this MT6789 vendor cpufreq branch, a `FREQ_QOS_MIN` request can enforce an
+effective floor without changing the base `policy->min` exported by
+`scaling_min_freq`. Generic tools such as Franco Kernel Manager read that sysfs
+value, so an active 2600MHz hard lock previously appeared as the stock minimum
+(2000000/2200000KHz) even while the CPU was actually pinned at 2600MHz.
+
+This addon snapshots the original `policy->min` once, keeps `FREQ_QOS_MIN` as
+the enforcement mechanism, and mirrors a successfully applied hard minimum into
+`policy->min` for sysfs/UI compatibility. When the lock is disabled or the
+module unloads, the original minimum is restored before the QoS request is
+removed and before the OC ceiling is restored.
+
+Expected state with both clusters locked at 2600MHz:
+
+```text
+policy0/scaling_min_freq = 2600000
+policy0/scaling_max_freq = 2600000
+policy6/scaling_min_freq = 2600000
+policy6/scaling_max_freq = 2600000
+```
+
+Apply a full 2600MHz lock:
+
+```bash
+P=/sys/module/overclock_mt6789/parameters
+echo 2600000 > $P/cpu_ll_target_khz
+echo 2600000 > $P/cpu_b_target_khz
+echo 2600000 > $P/cpu_ll_min_lock_khz
+echo 2600000 > $P/cpu_b_min_lock_khz
+echo 1       > $P/cpu_oc_apply
+cat $P/cpu_oc_result
+
+cat /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq
+cat /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq
+cat /sys/devices/system/cpu/cpufreq/policy6/scaling_min_freq
+cat /sys/devices/system/cpu/cpufreq/policy6/scaling_max_freq
+```
+
+To disable the hard lock and restore stock, clear the minimum locks and targets,
+then apply once. Do not clear only the targets while leaving a non-zero hard
+minimum configured.
+
+```bash
+P=/sys/module/overclock_mt6789/parameters
+echo 0 > $P/cpu_ll_min_lock_khz
+echo 0 > $P/cpu_b_min_lock_khz
+echo 0 > $P/cpu_ll_target_khz
+echo 0 > $P/cpu_b_target_khz
+echo 1 > $P/cpu_oc_apply
 ```
 
 ```bash
