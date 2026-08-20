@@ -558,11 +558,21 @@ MODULE_PARM_DESC(cpu_b_rep_cpu, "Representative CPU# for big cluster domain");
 
 static unsigned int cpu_ll_target_khz = 0;
 static unsigned int cpu_b_target_khz  = 0;
+/* Optional hard minimum lock.  This deliberately uses cpufreq FREQ_QOS_MIN
+ * instead of changing policy->min or rewriting the frequency table.  On
+ * MT6789 the latter can be rejected/clamped by the driver even when idx0
+ * itself is valid, while a QoS MIN request is the native policy mechanism. */
+static unsigned int cpu_ll_min_lock_khz = 0;
+static unsigned int cpu_b_min_lock_khz  = 0;
 static int          cpu_oc_apply      = 0;
 module_param(cpu_ll_target_khz, uint, 0644);
 MODULE_PARM_DESC(cpu_ll_target_khz, "Little cluster idx0 target freq in KHz (0=leave alone)");
 module_param(cpu_b_target_khz, uint, 0644);
 MODULE_PARM_DESC(cpu_b_target_khz, "Big cluster idx0 target freq in KHz (0=leave alone)");
+module_param(cpu_ll_min_lock_khz, uint, 0644);
+MODULE_PARM_DESC(cpu_ll_min_lock_khz, "Little cluster hard minimum in KHz (0=disabled; use only a valid OC target such as 2600000)");
+module_param(cpu_b_min_lock_khz, uint, 0644);
+MODULE_PARM_DESC(cpu_b_min_lock_khz, "Big cluster hard minimum in KHz (0=disabled; use only a valid OC target such as 2600000)");
 
 static char cpu_oc_result[256] = "not applied yet";
 static int cpu_oc_result_get(char *buf, const struct kernel_param *kp)
@@ -575,6 +585,14 @@ MODULE_PARM_DESC(cpu_oc_result, "CPU OC status (read-only)");
 
 static unsigned int g_ll_orig_khz, g_b_orig_khz;
 static bool         g_ll_have_orig, g_b_have_orig;
+
+/* Persistent policy requests for the optional hard minimum lock.  The
+ * request belongs to policy->constraints and survives normal governor
+ * changes; it is removed explicitly when the lock is disabled/unloaded. */
+static struct freq_qos_request g_ll_min_qos;
+static struct freq_qos_request g_b_min_qos;
+static bool g_ll_min_qos_added;
+static bool g_b_min_qos_added;
 
 #define QUIESCE_POLL_US     500U
 #define QUIESCE_TIMEOUT_US  50000U   /* 50ms — generous vs typical governor react time */
@@ -610,6 +628,55 @@ static int quiesce_off_idx0(struct cpufreq_policy *policy, struct cpufreq_mtk_mi
 /* EM's top perf-state is a permanent stock snapshot that
  * cpufreq_cooling.c prefers over policy->freq_table — without this,
  * cooling transitions snap policy->max back to stock. */
+/* Apply/remove a true cpufreq minimum through the policy's QoS constraints.
+ * This is intentionally separate from patch_cluster_idx0(): idx0/table/MMIO
+ * changes establish that 2600 MHz is an available top state; the QoS MIN lock
+ * is what asks cpufreq to never go below it.  No direct policy->min write is
+ * performed, and the frequency table is never rewritten by this path. */
+static int set_cluster_min_lock(unsigned int rep_cpu, unsigned int min_khz,
+				struct freq_qos_request *qos_req, bool *qos_added)
+{
+	struct cpufreq_policy *policy;
+	int ret;
+
+	policy = cpufreq_cpu_get(rep_cpu);
+	if (!policy)
+		return -ENODEV;
+
+	/* Disabling: remove the persistent request first. */
+	if (!min_khz) {
+		if (*qos_added) {
+			ret = freq_qos_remove_request(qos_req);
+			*qos_added = false;
+			cpufreq_cpu_put(policy);
+			return ret;
+		}
+		cpufreq_cpu_put(policy);
+		return 0;
+	}
+
+	/* A hard minimum must never exceed the policy ceiling that the OC
+	 * path has actually installed.  Refuse rather than letting cpufreq
+	 * resolve the conflict back to a stock frequency. */
+	if (min_khz > policy->max) {
+		cpufreq_cpu_put(policy);
+		return -ERANGE;
+	}
+
+	if (*qos_added) {
+		ret = freq_qos_update_request(qos_req, (s32)min_khz);
+		cpufreq_cpu_put(policy);
+		return ret;
+	}
+
+	ret = freq_qos_add_request(&policy->constraints, qos_req, FREQ_QOS_MIN,
+					   (s32)min_khz);
+	cpufreq_cpu_put(policy);
+	if (!ret)
+		*qos_added = true;
+	return ret;
+}
+
 static int patch_em_table(unsigned int rep_cpu, unsigned int use_khz)
 {
 	struct em_perf_domain *pd;
@@ -706,6 +773,7 @@ static int cpu_oc_apply_set(const char *val, const struct kernel_param *kp)
 {
 	unsigned int trigger;
 	int ret_ll = 0, ret_b = 0;
+	int min_ll = 0, min_b = 0;
 
 	if (kstrtouint(val, 10, &trigger))
 		return -EINVAL;
@@ -719,34 +787,69 @@ static int cpu_oc_apply_set(const char *val, const struct kernel_param *kp)
 
 	mutex_lock(&oc_lock);
 
-	if (cpu_ll_target_khz || g_ll_have_orig)
-		ret_ll = patch_cluster_idx0(cpu_ll_rep_cpu, cpu_ll_target_khz,
-					     &g_ll_orig_khz, &g_ll_have_orig);
-	if (cpu_b_target_khz || g_b_have_orig)
-		ret_b = patch_cluster_idx0(cpu_b_rep_cpu, cpu_b_target_khz,
-					    &g_b_orig_khz, &g_b_have_orig);
+	/* A hard minimum is only meaningful when the same cluster has an OC
+	 * ceiling at or above it.  Never let cpufreq resolve an impossible
+	 * min>max pair back to the stock OPP. */
+	if (cpu_ll_min_lock_khz &&
+	    (!cpu_ll_target_khz || cpu_ll_min_lock_khz > cpu_ll_target_khz))
+		min_ll = -ERANGE;
+	if (cpu_b_min_lock_khz &&
+	    (!cpu_b_target_khz || cpu_b_min_lock_khz > cpu_b_target_khz))
+		min_b = -ERANGE;
+
+	/* Disable an old lock before restoring a stock ceiling. */
+	if (!cpu_ll_min_lock_khz || !cpu_ll_target_khz)
+		set_cluster_min_lock(cpu_ll_rep_cpu, 0, &g_ll_min_qos, &g_ll_min_qos_added);
+	if (!cpu_b_min_lock_khz || !cpu_b_target_khz)
+		set_cluster_min_lock(cpu_b_rep_cpu, 0, &g_b_min_qos, &g_b_min_qos_added);
+
+	if (min_ll || min_b) {
+		ret_ll = min_ll;
+		ret_b = min_b;
+	} else {
+		if (cpu_ll_target_khz || g_ll_have_orig)
+			ret_ll = patch_cluster_idx0(cpu_ll_rep_cpu, cpu_ll_target_khz,
+						     &g_ll_orig_khz, &g_ll_have_orig);
+		if (cpu_b_target_khz || g_b_have_orig)
+			ret_b = patch_cluster_idx0(cpu_b_rep_cpu, cpu_b_target_khz,
+						    &g_b_orig_khz, &g_b_have_orig);
+
+		/* Only after the OC ceiling is installed do we add the hard MIN.
+		 * This avoids the exact min=2600/max=stock rejection seen on this
+		 * device. */
+		if (!ret_ll && cpu_ll_min_lock_khz)
+			ret_ll = set_cluster_min_lock(cpu_ll_rep_cpu, cpu_ll_min_lock_khz,
+						       &g_ll_min_qos, &g_ll_min_qos_added);
+		if (!ret_b && cpu_b_min_lock_khz)
+			ret_b = set_cluster_min_lock(cpu_b_rep_cpu, cpu_b_min_lock_khz,
+						      &g_b_min_qos, &g_b_min_qos_added);
+	}
 
 	if (ret_ll == -ERANGE || ret_b == -ERANGE)
 		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
-			 "FAIL: target exceeds cap (+%d%% over stock, %uMHz absolute ceiling — whichever is lower)",
-			 MAX_OC_PERCENT_OVER_STOCK, MAX_OC_ABSOLUTE_KHZ / 1000);
+			 "FAIL: hard MIN requires a matching OC MAX (ll=%u/%u, b=%u/%u KHz)",
+			 cpu_ll_min_lock_khz, cpu_ll_target_khz,
+			 cpu_b_min_lock_khz, cpu_b_target_khz);
 	else if (ret_ll == -ETIMEDOUT || ret_b == -ETIMEDOUT)
 		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
 			 "FAIL: cluster wouldn't leave idx0 within %ums — nothing touched",
 			 QUIESCE_TIMEOUT_US / 1000);
 	else if (ret_ll || ret_b)
 		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
-			 "FAIL: ll=%d b=%d (cpu offline? domain not found?)", ret_ll, ret_b);
+			 "FAIL: ll=%d b=%d (cpu offline? domain not found? QoS MIN rejected?)",
+			 ret_ll, ret_b);
 	else
 		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
-			 "OK: ll_idx0=%uKHz b_idx0=%uKHz (orig ll=%u b=%u) — no explicit voltage control, SVS autonomous",
+			 "OK: ll_max=%uKHz b_max=%uKHz ll_min_lock=%uKHz b_min_lock=%uKHz (orig ll=%u b=%u)",
 			 cpu_ll_target_khz ? cpu_ll_target_khz : g_ll_orig_khz,
 			 cpu_b_target_khz ? cpu_b_target_khz : g_b_orig_khz,
+			 cpu_ll_min_lock_khz, cpu_b_min_lock_khz,
 			 g_ll_orig_khz, g_b_orig_khz);
 
 	mutex_unlock(&oc_lock);
 	return 0;
 }
+
 static int cpu_oc_apply_get(char *buf, const struct kernel_param *kp)
 {
 	return scnprintf(buf, PAGE_SIZE, "0\n");
@@ -1097,6 +1200,8 @@ static void __exit oc_mt6789_exit(void)
 		unregister_kretprobe(&krp_gpufreq_commit);
 
 	mutex_lock(&oc_lock);
+	set_cluster_min_lock(cpu_ll_rep_cpu, 0, &g_ll_min_qos, &g_ll_min_qos_added);
+	set_cluster_min_lock(cpu_b_rep_cpu, 0, &g_b_min_qos, &g_b_min_qos_added);
 	gpu_restore_working_table();
 	if (g_ll_have_orig)
 		patch_cluster_idx0(cpu_ll_rep_cpu, 0, &g_ll_orig_khz, &g_ll_have_orig);
