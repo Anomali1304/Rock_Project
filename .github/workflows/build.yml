@@ -67,7 +67,7 @@ on:
         type: boolean
         default: true
       cache_workspace:
-        description: "Cache the built workspace to speed up a later rerun with the same config"
+        description: "Cache safe repo metadata and toolchains to speed up later runs with the same config"
         type: boolean
         default: true
 
@@ -109,21 +109,25 @@ jobs:
           sudo docker image prune -af || true
           df -h
 
-      # Cache key is the real build fingerprint from lib/functions.sh
-      # build_fingerprint() (repo/branch/manifest/root/lto) — sourced
-      # directly so this never silently drifts from the script's own
-      # mismatch check. KERNEL_REPO/GKI_MANIFEST_BRANCH aren't
-      # workflow inputs, so they come from config/defaults.env as-is.
+      # Cache key includes the build configuration and the cache layout itself.
+      # Bumping the layout/version prevents older workspace archives from being
+      # restored after cache-related fixes.
       - name: Compute cache key
         id: cache_key
+        env:
+          CACHE_LAYOUT: v3-no-common-worktree
+          KERNEL_BRANCH_INPUT: ${{ inputs.kernel_branch }}
+          ROOT_TYPE_INPUT: ${{ inputs.root_type }}
+          LTO_MODE_INPUT: ${{ inputs.lto_mode }}
         run: |
-          export KERNEL_BRANCH="${{ inputs.kernel_branch }}"
-          export ROOT_TYPE="${{ inputs.root_type }}"
-          export LTO_MODE="${{ inputs.lto_mode }}"
+          export KERNEL_BRANCH="$KERNEL_BRANCH_INPUT"
+          export ROOT_TYPE="$ROOT_TYPE_INPUT"
+          export LTO_MODE="$LTO_MODE_INPUT"
           source config/defaults.env
           source lib/functions.sh
           FP="$(build_fingerprint)"
-          echo "key=rock-workspace-v2-$(echo -n "$FP" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          CFG_HASH="$(sha256sum .github/workflows/build.yml stages/10-download.sh lib/functions.sh config/defaults.env | sha256sum | cut -c1-16)"
+          echo "key=rock-workspace-v3-$(printf '%s|%s|%s' "$FP" "$CACHE_LAYOUT" "$CFG_HASH" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       - name: Restore workspace
         if: inputs.cache_workspace
@@ -132,12 +136,9 @@ jobs:
         with:
           path: |
             workspace/.repo
-            workspace/common
-            workspace/out
             workspace/prebuilts
-            workspace/build.config.common
-            workspace/build.config.aarch64
-            workspace/.fingerprint
+            workspace/clang-zyc
+            workspace/clang-custom
           key: ${{ steps.cache_key.outputs.key }}-${{ github.run_id }}
           restore-keys: |
             ${{ steps.cache_key.outputs.key }}-
@@ -145,23 +146,17 @@ jobs:
       - name: Run build
         run: bash build.sh
 
-      # Saved explicitly and only on success, so a run that fails or
-      # gets killed mid-sync (e.g. by the concurrency cancel-in-progress
-      # group) never overwrites the cache with a half-checked-out
-      # workspace/common/.git — that's what produced the "unsupported
-      # checkout state" repo-sync failure this replaced.
+      # Saved only after a successful build. The cache deliberately excludes
+      # workspace/common, so a broken Git worktree can never be restored.
       - name: Save workspace
         if: always() && inputs.cache_workspace && success()
         uses: actions/cache/save@v4
         with:
           path: |
             workspace/.repo
-            workspace/common
-            workspace/out
             workspace/prebuilts
-            workspace/build.config.common
-            workspace/build.config.aarch64
-            workspace/.fingerprint
+            workspace/clang-zyc
+            workspace/clang-custom
           key: ${{ steps.cache_key.outputs.key }}-${{ github.run_id }}
 
       # release-out/ contains, every run:
