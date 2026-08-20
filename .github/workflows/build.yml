@@ -123,13 +123,14 @@ jobs:
           source config/defaults.env
           source lib/functions.sh
           FP="$(build_fingerprint)"
-          echo "key=rock-workspace-$(echo -n "$FP" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "key=rock-workspace-v2-$(echo -n "$FP" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       - name: Restore/cache workspace
         if: inputs.cache_workspace
         uses: actions/cache@v4
         with:
           path: |
+            workspace/.repo
             workspace/common
             workspace/out
             workspace/prebuilts
