@@ -112,8 +112,10 @@ echo 1 > /sys/module/overclock_mt6789/parameters/gpu_oc_apply
 
 | Parameter | Access | Description |
 |-----------|--------|-------------|
-| `cpu_ll_target_khz` | RW | Little cluster idx0 target freq, KHz (`0` = leave alone) |
-| `cpu_b_target_khz` | RW | Big cluster idx0 target freq, KHz (`0` = leave alone) |
+| `cpu_ll_target_khz` | RW | Little cluster idx0 target/max OC freq, KHz (`0` = restore stock) |
+| `cpu_ll_min_lock_khz` | RW | Little cluster hard minimum via FREQ_QOS_MIN (`0` = disabled; `2600000` = lock at 2600MHz after OC max is installed) |
+| `cpu_b_target_khz` | RW | Big cluster idx0 target/max OC freq, KHz (`0` = restore stock) |
+| `cpu_b_min_lock_khz` | RW | Big cluster hard minimum via FREQ_QOS_MIN (`0` = disabled; `2600000` = lock at 2600MHz after OC max is installed) |
 | `cpu_oc_apply` | W | Write `1` to apply both targets |
 | `cpu_oc_result` | R | Result string of last apply |
 | `cpu_ll_rep_cpu` / `cpu_b_rep_cpu` | R | Representative CPU# per cluster domain (fixed: 0 / 6) |
