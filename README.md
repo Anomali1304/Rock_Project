@@ -113,10 +113,10 @@ breakdown and [`docs/ADDONS.md`](docs/ADDONS.md) for how to add a new addon.
 
 One `workflow_dispatch` workflow, `.github/workflows/build.yml`: every
 knob (`root_type`, `lto_mode`, `addons`, `modules_filter`, etc.) is a
-workflow input. `cache_workspace` caches the finished workspace (keyed
-on kernel repo/branch/root type/LTO mode) purely to speed up a later
-rerun with the *same* config — it never changes what gets built or
-packaged.
+workflow input. `cache_workspace` caches safe repo metadata and toolchains (keyed on
+the build configuration and cache layout) to speed up later runs with
+the same config. It never caches the checked-out `workspace/common`
+worktree, so stale Git checkout state cannot break a build.
 
 ## Output
 
